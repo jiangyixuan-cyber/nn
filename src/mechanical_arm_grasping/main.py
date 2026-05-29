@@ -1,10 +1,11 @@
-# MuJoCo 3.4.0 带自动复位的3自由度机械臂精准取放（增加夹爪力度控制）
+# MuJoCo 3.4.0 带自动复位的3自由度机械臂精准取放（增加抓取计时功能）
 import sys
 import mujoco
 import mujoco.viewer
 import time
 import numpy as np
 import datetime
+import random
 
 # 退出码定义
 EXIT_SUCCESS = 0
@@ -217,17 +218,29 @@ def robot_arm_auto_reset_demo():
         return True
 
     def target_auto_reset(viewer):
-        """目标物体自动重置到原位"""
-        print("\n🔧 目标物体自动重置中...")
+        """目标物体自动重置到随机位置"""
+        print("\n🔧 目标物体随机重置中...")
+        
+        # 随机位置范围（可根据需要调整）
+        x_range = (0.5, 1.2)  # X 范围 0.5~1.2
+        y_range = (0.3, 1.2)  # Y 范围 0.3~1.2
+        z = 0.0               # Z 高度固定
+        
+        random_x = random.uniform(x_range[0], x_range[1])
+        random_y = random.uniform(y_range[0], y_range[1])
+        
         target_ball_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_ball")
-        target_qpos = np.array([0.9, 0.6, 0.0, 1, 0, 0, 0])
+        target_qpos = np.array([random_x, random_y, z, 1, 0, 0, 0])
         data.qpos[7:14] = target_qpos
         data.qvel[6:12] = 0
         mujoco.mj_step(model, data)
-        print("✅ 目标物体已重置到原位")
+        print(f"✅ 目标物体已重置到随机位置: ({random_x:.2f}, {random_y:.2f}, {z})")
 
     def grab_and_place(viewer, retry_max=2, speed="medium", grip_force="medium"):
-        """完整取放流程（含自动重试、连续失败提醒、速度控制、力度控制）"""
+        """完整取放流程（含自动重试、连续失败提醒、速度控制、力度控制、计时）"""
+        # 记录本次抓取开始时间
+        grasp_start_time = time.time()
+        
         retry_count = 0
         success = False
         consecutive_fails = 0
@@ -258,7 +271,12 @@ def robot_arm_auto_reset_demo():
 
                 success = True
                 consecutive_fails = 0
+                
+                # 计算本次抓取耗时
+                grasp_elapsed = time.time() - grasp_start_time
                 print(f"\n\n🎉 第 {retry_count+1} 次抓取尝试成功！")
+                print(f"⏱️ 本次抓取耗时: {grasp_elapsed:.2f} 秒")
+                
             except Exception as e:
                 retry_count += 1
                 consecutive_fails += 1
@@ -323,7 +341,10 @@ def robot_arm_auto_reset_demo():
             else:
                 print(f"⚠️ 力度参数 '{force_arg}' 无效，使用默认 'medium'")
         
+        # ========== 计时相关变量 ==========
+        total_start_time = time.time()  # 整个程序开始时间
         success_count = 0
+        round_times = []  # 记录每次抓取耗时
 
         for round_num in range(1, total_rounds + 1):
             print(f"\n{'='*40}")
@@ -352,10 +373,13 @@ def robot_arm_auto_reset_demo():
 
         # ========== 输出统计结果 ==========
         actual_rate = success_count / total_rounds * 100
+        total_elapsed = time.time() - total_start_time
         print(f"\n{'='*50}")
         print(f"🎉 所有抓取完成！")
         print(f"📊 统计结果：成功 {success_count}/{total_rounds} 次")
         print(f"📈 成功率：{actual_rate:.1f}%")
+        print(f"⏱️ 总耗时: {total_elapsed:.2f} 秒")
+        print(f"⏱️ 平均每次耗时: {total_elapsed/total_rounds:.2f} 秒")
         print(f"{'='*50}")
 
         # ========== 成功率阈值检查 ==========
@@ -374,10 +398,10 @@ def robot_arm_auto_reset_demo():
             viewer.sync()
             time.sleep(0.001)
 
-    # 保存日志到文件
+    # 保存日志到文件（增加耗时记录）
     try:
         with open("grasp_log.txt", "a", encoding="gbk") as f:
-            f.write(f"[{datetime.datetime.now()}] 抓取{total_rounds}次, 成功{success_count}次, 成功率{actual_rate:.1f}%, 速度:{speed}, 力度:{grip_force}\n")
+            f.write(f"[{datetime.datetime.now()}] 抓取{total_rounds}次, 成功{success_count}次, 成功率{actual_rate:.1f}%, 速度:{speed}, 力度:{grip_force}, 总耗时:{total_elapsed:.2f}秒\n")
         print("📝 日志已保存到 grasp_log.txt")
     except Exception as e:
         print(f"⚠️ 日志保存失败：{e}")

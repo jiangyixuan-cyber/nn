@@ -10,16 +10,22 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
+import sys
+import os
+
+# 添加 CARLA PythonAPI 路径
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'CARLA_0.9.15', 'WindowsNoEditor', 'PythonAPI', 'carla'))
+
 import argparse
 import collections
 import datetime
 import glob
 import logging
 import math
-import os
 import random
 import re
-import sys
 import weakref
 
 try:
@@ -59,7 +65,7 @@ import carla
 from carla import ColorConverter as cc
 
 from agents.navigation.behavior_agent import BehaviorAgent  # pylint: disable=import-error
-from agents.navigation.roaming_agent import RoamingAgent  # pylint: disable=import-error
+#from agents.navigation.roaming_agent import RoamingAgent  # pylint: disable=import-error
 from agents.navigation.basic_agent import BasicAgent  # pylint: disable=import-error
 
 
@@ -200,7 +206,9 @@ class World(object):
 
 class KeyboardControl(object):
     def __init__(self, world):
+        self.world = world
         world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
+
 
     def parse_events(self):
         for event in pygame.event.get():
@@ -209,6 +217,78 @@ class KeyboardControl(object):
             if event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
                     return True
+                elif event.key == pygame.K_c:
+                    # 切换摄像头视角
+                    self.world.camera_manager.toggle_camera()
+                    self.world.hud.notification("Camera angle changed", seconds=1.0)
+                elif event.key == pygame.K_h:
+                    # 显示帮助
+                    self.world.hud.help.toggle()
+                elif event.key == pygame.K_n:
+                    # 切换下一种天气
+                    self.world.next_weather(reverse=False)
+                    self.world.hud.notification("Weather changed", seconds=1.0)
+                elif event.key == pygame.K_m:
+                    # 切换上一种天气
+                    self.world.next_weather(reverse=True)
+                    self.world.hud.notification("Weather changed", seconds=1.0)
+                elif event.key == pygame.K_g:
+                    # 生成随机行人
+                    self.spawn_random_pedestrian()
+                    self.world.hud.notification("Pedestrian spawned", seconds=1.0)
+
+    def spawn_random_pedestrian(self):
+        """在车辆附近生成一个随机行人的方法"""
+        world = self.world.world
+        player_transform = self.world.player.get_transform()
+
+        # 获取行人蓝图
+        blueprint_library = world.get_blueprint_library()
+        pedestrian_bps = blueprint_library.filter('walker.pedestrian.*')
+        if not pedestrian_bps:
+            self.world.hud.notification("No pedestrian blueprints found", seconds=2.0)
+            return
+
+        # 随机选择一个行人类型
+        pedestrian_bp = random.choice(pedestrian_bps)
+
+        # 在车辆前方 5-10 米，侧方随机偏移的位置生成
+        spawn_offset = carla.Location(
+            x=random.uniform(5.0, 10.0),
+            y=random.uniform(-3.0, 3.0),
+            z=0.0
+        )
+        spawn_location = player_transform.transform(spawn_offset)
+        spawn_location.z += 0.5  # 抬高一点，防止卡地
+
+        # 调整旋转角度，使其面向车辆或随机方向
+        rotation = carla.Rotation(yaw=random.uniform(0, 360))
+        transform = carla.Transform(spawn_location, rotation)
+
+        # 尝试生成行人
+        pedestrian = world.try_spawn_actor(pedestrian_bp, transform)
+        if pedestrian is None:
+            self.world.hud.notification("Failed to spawn pedestrian", seconds=2.0)
+            return
+
+        # 给行人设置行走控制（随机速度 0.5-2.0 m/s，随机方向）
+        walker_control = carla.WalkerControl()
+        walker_control.speed = random.uniform(0.5, 2.0)
+        # 随机行走方向（偏航角）
+        direction_angle = random.uniform(-180, 180)
+        walker_control.direction = carla.Vector3D(
+            x=math.cos(math.radians(direction_angle)),
+            y=math.sin(math.radians(direction_angle)),
+            z=0.0
+        )
+        pedestrian.apply_control(walker_control)
+
+        # 保存到一个列表中，以便后续清理（可选）
+        if not hasattr(self, 'spawned_pedestrians'):
+            self.spawned_pedestrians = []
+        self.spawned_pedestrians.append(pedestrian)
+
+        self.world.hud.notification(f"Pedestrian: {pedestrian.type_id.split('.')[-1]}", seconds=1.0)
 
     @staticmethod
     def _is_quit_shortcut(key):
@@ -241,6 +321,8 @@ class HUD(object):
         self._show_info = True
         self._info_text = []
         self._server_clock = pygame.time.Clock()
+        self.total_distance = 0.0
+        self.last_location = None
 
     def on_world_tick(self, timestamp):
         """Gets informations from the world at every tick"""
@@ -251,6 +333,14 @@ class HUD(object):
 
     def tick(self, world, clock):
         """HUD method for every tick"""
+        # 计算行驶里程
+        current_location = world.player.get_location()
+        if self.last_location is not None:
+            # 计算移动距离（米）
+            delta = current_location.distance(self.last_location)
+            self.total_distance += delta
+        self.last_location = current_location
+
         self._notifications.tick(world, clock)
         if not self._show_info:
             return
@@ -280,6 +370,7 @@ class HUD(object):
             'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (transform.location.x, transform.location.y)),
             'GNSS:% 24s' % ('(% 2.6f, % 3.6f)' % (world.gnss_sensor.lat, world.gnss_sensor.lon)),
             'Height:  % 18.0f m' % transform.location.z,
+            'Odometer: % 10.2f km' % (self.total_distance / 1000.0),
             '']
         if isinstance(control, carla.VehicleControl):
             self._info_text += [
@@ -411,9 +502,26 @@ class HelpText(object):
 
     def __init__(self, font, width, height):
         """Constructor method"""
-        lines = __doc__.split('\n')
+        lines = [
+            "=== CARLA Help ===",
+            "",
+            "C        - Switch Camera View",
+            "H        - Show/Hide Help",
+            "N        - Next Weather",
+            "M        - Previous Weather",
+            "G        - Spawn Random Pedestrian",
+            "Ctrl+Q   - Quit",
+            "ESC      - Quit",
+            "",
+            "--agent Basic      - Basic Mode",
+            "--agent Behavior   - Behavior Mode (Traffic Light)",
+            "--loop             - Loop Mode",
+            "--behavior normal  - Driving Style (normal/cautious/aggressive)",
+            "",
+            "Traffic Light: Behavior Agent mode only",
+        ]
         self.font = font
-        self.dim = (680, len(lines) * 22 + 12)
+        self.dim = (900, len(lines) * 22 + 12)
         self.pos = (0.5 * width - 0.5 * self.dim[0], 0.5 * height - 0.5 * self.dim[1])
         self.seconds_left = 0
         self.surface = pygame.Surface(self.dim)
@@ -692,9 +800,7 @@ def game_loop(args):
         elif args.agent == "Basic":
             agent = BasicAgent(world.player)
             spawn_point = world.map.get_spawn_points()[0]
-            agent.set_destination((spawn_point.location.x,
-                                   spawn_point.location.y,
-                                   spawn_point.location.z))
+            agent.set_destination(spawn_point.location)
         else:
             agent = BehaviorAgent(world.player, behavior=args.behavior)
 
