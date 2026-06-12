@@ -19,6 +19,7 @@ import logging.handlers
 import time
 import random
 import json
+import pygame
 from datetime import datetime
 from pathlib import Path
 
@@ -361,7 +362,7 @@ def run_quick_test(args, sim_logger=None):
         sim_logger: SimulationLogger instance for enhanced logging
     """
     import carla
-    from carla_av_simulation import SimulationDashboard
+    from carla_av_simulation import SimulationDashboard, WeatherScheduler, HUDOverlay
     
     log = sim_logger.logger if sim_logger else logging.getLogger()
 
@@ -408,9 +409,14 @@ def run_quick_test(args, sim_logger=None):
             weather_params['fog_density'] = args.fog_density
             log.info(f"Using custom fog density: {args.fog_density}")
 
-        weather = carla.WeatherParameters(**weather_params)
-        world.set_weather(weather)
-        log.info(f"Weather set to: {args.weather}")
+        weather_scheduler = WeatherScheduler(
+            scenario_name='storm_front',
+            duration=args.duration,
+            enable_random_events=True
+        )
+        initial_params = weather_scheduler.update(0)
+        world.set_weather(carla.WeatherParameters(**initial_params))
+        log.info(f"Weather scheduler started: {weather_scheduler.get_scenario_name()}")
 
         blueprint_library = world.get_blueprint_library()
 
@@ -459,19 +465,41 @@ def run_quick_test(args, sim_logger=None):
 
         dashboard = SimulationDashboard(
             duration=args.duration,
-            weather_name=args.weather,
+            weather_name=weather_scheduler.get_scenario_name(),
             mode='quick'
         )
         dashboard.vehicles_count = len(spawned_vehicles)
         dashboard.start()
 
+        if not pygame.get_init():
+            pygame.init()
+        hud_display = pygame.display.set_mode((800, 600), pygame.HWSURFACE | pygame.DOUBLEBUF)
+        pygame.display.set_caption("CARLA AV Simulation - HUD")
+        hud = HUDOverlay((800, 600))
+
         start_time = time.time()
         frame_count = 0
-        last_weather_intensity = 1.0
+        last_weather_update = 0
+        last_hud_update = 0
 
         try:
             while time.time() - start_time < args.duration and not dashboard.quit_requested:
                 dashboard.check_keyboard()
+
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        dashboard.quit_requested = True
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_SPACE:
+                            dashboard.paused = not dashboard.paused
+                        elif event.key == pygame.K_h:
+                            hud.toggle()
+                        elif event.key == pygame.K_p:
+                            hud.save_screenshot(hud_display, weather_scheduler.current_phase)
+                        elif event.key == pygame.K_q:
+                            dashboard.quit_requested = True
+                        elif event.key == pygame.K_d:
+                            dashboard.debug_mode = not dashboard.debug_mode
 
                 if dashboard.quit_requested:
                     log.info("Quit requested by user")
@@ -481,20 +509,24 @@ def run_quick_test(args, sim_logger=None):
                     time.sleep(0.05)
                     elapsed = time.time() - start_time
                     dashboard.update(elapsed=elapsed)
+                    hud.render(hud_display, vehicle=vehicle, weather_phase=weather_scheduler.get_phase_label(),
+                               elapsed=elapsed, duration=args.duration, paused=True,
+                               frame_count=frame_count, memory_mb=mem_mb if 'mem_mb' in dir() else 0,
+                               camera_frames=0, lidar_frames=0, radar_frames=0,
+                               vehicles_count=len(spawned_vehicles), debug_mode=dashboard.debug_mode, mode='quick')
+                    pygame.display.flip()
                     continue
-
-                if dashboard.weather_intensity != last_weather_intensity:
-                    scaled = dashboard.get_scaled_weather_params(weather_params)
-                    new_weather = carla.WeatherParameters(**scaled)
-                    world.set_weather(new_weather)
-                    last_weather_intensity = dashboard.weather_intensity
-                    log.info(f"Weather intensity adjusted: {dashboard.weather_intensity*100:.0f}%")
 
                 world.tick()
                 frame_count += 1
 
                 current_time = time.time()
                 elapsed = current_time - start_time
+
+                if current_time - last_weather_update >= 1.0:
+                    weather_params = weather_scheduler.update(elapsed)
+                    world.set_weather(carla.WeatherParameters(**weather_params))
+                    last_weather_update = current_time
 
                 fps = frame_count / elapsed if elapsed > 0 else 0
                 mem_mb = 0
@@ -512,7 +544,20 @@ def run_quick_test(args, sim_logger=None):
                     fps=fps,
                     memory_mb=mem_mb,
                     frame_count=frame_count,
+                    weather_phase=weather_scheduler.get_phase_label(),
                 )
+
+                if current_time - last_hud_update >= 0.25:
+                    hud_display.fill((20, 20, 30))
+                    hud.render(hud_display, vehicle=vehicle,
+                               weather_phase=weather_scheduler.get_phase_label(),
+                               fps=fps, elapsed=elapsed, duration=args.duration,
+                               paused=dashboard.paused, frame_count=frame_count,
+                               memory_mb=mem_mb, camera_frames=0, lidar_frames=0, radar_frames=0,
+                               vehicles_count=len(spawned_vehicles),
+                               debug_mode=dashboard.debug_mode, mode='quick')
+                    pygame.display.flip()
+                    last_hud_update = current_time
 
         except KeyboardInterrupt:
             log.info("Simulation interrupted by user")
