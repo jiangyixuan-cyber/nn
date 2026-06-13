@@ -908,6 +908,8 @@ class AVSimulation:
                 self._font = pygame.font.Font(None, 36)
                 self._text_cache = {}
                 self._text_cache_frame = -1
+                self.hud = HUDOverlay(tuple(window_size))
+                self._hud_vehicle = None
             except pygame.error as e:
                 raise SimulationError(f"Failed to initialize Pygame display: {str(e)}")
 
@@ -1345,8 +1347,9 @@ class AVSimulation:
                 scaled[key] = round(value * intensity, 1)
         return scaled
 
-    def run_simulation(self, config_name, duration_seconds=600):
+    def run_simulation(self, config_name, duration_seconds=600, weather_scenario='storm_front'):
         dashboard = None
+        weather_scheduler = None
         try:
             settings = self.world.get_settings()
             settings.synchronous_mode = True
@@ -1361,10 +1364,14 @@ class AVSimulation:
             traffic_vehicles = []
             pedestrians = []
 
-            weather = self.setup_weather()
-            logging.info("Weather configured successfully")
-
-            base_weather_params = self.config_loader.get_weather_params()
+            weather_scheduler = WeatherScheduler(
+                scenario_name=weather_scenario,
+                duration=duration_seconds,
+                enable_random_events=True
+            )
+            initial_params = weather_scheduler.update(0)
+            self.world.set_weather(carla.WeatherParameters(**initial_params))
+            logging.info(f"Weather scheduler started: {weather_scheduler.get_scenario_name()}")
 
             blueprint = self.world.get_blueprint_library().find('vehicle.yamaha.yzf')
             spawn_points = self.map.get_spawn_points()
@@ -1404,7 +1411,7 @@ class AVSimulation:
 
             dashboard = SimulationDashboard(
                 duration=duration_seconds,
-                weather_name='storm',
+                weather_name=weather_scheduler.get_scenario_name(),
                 mode=f'full ({config_name})'
             )
             dashboard.vehicles_count = len(traffic_vehicles)
@@ -1412,13 +1419,17 @@ class AVSimulation:
             dashboard.start()
 
             paused = False
-            weather_intensity = 1.0
             debug_mode = False
             quit_requested = False
+            self._hud_vehicle = vehicle
+            self._hud_duration = duration_seconds
+            self._hud_mode = f'full ({config_name})'
+            self._hud_vehicles_count = len(traffic_vehicles)
 
             start_time = time.time()
             frame_count = 0
             last_dash_update = 0
+            last_weather_update = 0
 
             while time.time() - start_time < duration_seconds and not quit_requested:
                 try:
@@ -1429,24 +1440,18 @@ class AVSimulation:
                             if event.key == pygame.K_SPACE:
                                 paused = not paused
                                 dashboard.paused = paused
-                            elif event.key == pygame.K_w:
-                                weather_intensity = min(1.0, round(weather_intensity + 0.1, 1))
-                                dashboard.weather_intensity = weather_intensity
-                                scaled = self._scale_weather_params(base_weather_params, weather_intensity)
-                                self.world.set_weather(carla.WeatherParameters(**scaled))
-                                logging.info(f"Weather intensity: {weather_intensity*100:.0f}%")
-                            elif event.key == pygame.K_s:
-                                weather_intensity = max(0.0, round(weather_intensity - 0.1, 1))
-                                dashboard.weather_intensity = weather_intensity
-                                scaled = self._scale_weather_params(base_weather_params, weather_intensity)
-                                self.world.set_weather(carla.WeatherParameters(**scaled))
-                                logging.info(f"Weather intensity: {weather_intensity*100:.0f}%")
+                                self._hud_paused = paused
                             elif event.key == pygame.K_q:
                                 quit_requested = True
                                 dashboard.quit_requested = True
                             elif event.key == pygame.K_d:
                                 debug_mode = not debug_mode
                                 dashboard.debug_mode = debug_mode
+                                self._hud_debug_mode = debug_mode
+                            elif event.key == pygame.K_h:
+                                self.hud.toggle()
+                            elif event.key == pygame.K_p:
+                                self.hud.save_screenshot(self.display, weather_scheduler.current_phase)
 
                     if paused:
                         time.sleep(0.05)
@@ -1456,6 +1461,16 @@ class AVSimulation:
 
                     self.world.tick()
                     
+                    now = time.time()
+                    elapsed = now - start_time
+
+                    if now - last_weather_update >= 1.0:
+                        weather_params = weather_scheduler.update(elapsed)
+                        self.world.set_weather(carla.WeatherParameters(**weather_params))
+                        self._hud_weather_phase = weather_scheduler.get_phase_label()
+                        self.hud.auto_screenshot_on_phase_change(self.display, weather_scheduler.current_phase)
+                        last_weather_update = now
+
                     mem_status = self.memory_monitor.check_memory(
                         self.sensor_data, time.time()
                     )
@@ -1473,11 +1488,11 @@ class AVSimulation:
                     
                     frame_count += 1
                     
-                    now = time.time()
-                    elapsed = now - start_time
                     if now - last_dash_update >= 0.25:
                         fps = frame_count / elapsed if elapsed > 0 else 0
                         mem_mb = self.memory_monitor.get_memory_mb()
+                        self._hud_elapsed = elapsed
+                        self._hud_memory_mb = mem_mb
                         dashboard.update(
                             elapsed=elapsed,
                             fps=fps,
@@ -1492,7 +1507,8 @@ class AVSimulation:
                                 'image': self.image_queue.qsize(),
                                 'lidar': self.lidar_queue.qsize(),
                                 'radar': self.radar_queue.qsize(),
-                            }
+                            },
+                            weather_phase=weather_scheduler.get_phase_label(),
                         )
                         last_dash_update = now
                 
@@ -1510,7 +1526,7 @@ class AVSimulation:
             self.export_data(".")
 
             mem_summary = self.memory_monitor.get_summary()
-            logging.info(f"💾 Memory Monitor Summary:")
+            logging.info(f"Memory Monitor Summary:")
             logging.info(f"   Incremental exports: {mem_summary['export_count']}")
             logging.info(f"   Peak memory: {mem_summary['peak_memory_mb']:.1f}MB / {mem_summary['max_memory_mb']}MB")
 
@@ -1804,16 +1820,383 @@ class AVSimulation:
             except Exception as e:
                 logging.warning(f"Failed to render text overlay: {str(e)}")
 
+            if hasattr(self, 'hud') and self.hud.visible:
+                self.hud.render(
+                    self.display,
+                    vehicle=self._hud_vehicle,
+                    weather_phase=getattr(self, '_hud_weather_phase', ''),
+                    fps=self._viz_fps,
+                    elapsed=getattr(self, '_hud_elapsed', 0),
+                    duration=getattr(self, '_hud_duration', 0),
+                    paused=getattr(self, '_hud_paused', False),
+                    frame_count=len(self.sensor_data.get('camera', [])),
+                    memory_mb=getattr(self, '_hud_memory_mb', 0),
+                    camera_frames=len(self.sensor_data.get('camera', [])),
+                    lidar_frames=len(self.sensor_data.get('lidar', [])),
+                    radar_frames=len(self.sensor_data.get('radar', [])),
+                    vehicles_count=getattr(self, '_hud_vehicles_count', 0),
+                    debug_mode=getattr(self, '_hud_debug_mode', False),
+                    mode=getattr(self, '_hud_mode', ''),
+                )
+
             pygame.display.flip()
 
         except Exception as e:
             logging.error(f"Error in visualization: {str(e)}")
+class WeatherScheduler:
+    WEATHER_PRESETS = {
+        'clear_noon': {
+            'cloudiness': 10.0, 'precipitation': 0.0, 'precipitation_deposits': 0.0,
+            'wind_intensity': 5.0, 'fog_density': 0.0, 'wetness': 0.0,
+            'sun_altitude_angle': 75.0
+        },
+        'cloudy': {
+            'cloudiness': 70.0, 'precipitation': 0.0, 'precipitation_deposits': 0.0,
+            'wind_intensity': 15.0, 'fog_density': 5.0, 'wetness': 5.0,
+            'sun_altitude_angle': 60.0
+        },
+        'light_rain': {
+            'cloudiness': 50.0, 'precipitation': 30.0, 'precipitation_deposits': 15.0,
+            'wind_intensity': 20.0, 'fog_density': 8.0, 'wetness': 30.0,
+            'sun_altitude_angle': 55.0
+        },
+        'heavy_rain': {
+            'cloudiness': 100.0, 'precipitation': 100.0, 'precipitation_deposits': 100.0,
+            'wind_intensity': 60.0, 'fog_density': 15.0, 'wetness': 100.0,
+            'sun_altitude_angle': 40.0
+        },
+        'storm': {
+            'cloudiness': 100.0, 'precipitation': 100.0, 'precipitation_deposits': 100.0,
+            'wind_intensity': 100.0, 'fog_density': 40.0, 'wetness': 100.0,
+            'sun_altitude_angle': 15.0
+        },
+        'fog_morning': {
+            'cloudiness': 80.0, 'precipitation': 5.0, 'precipitation_deposits': 0.0,
+            'wind_intensity': 5.0, 'fog_density': 85.0, 'wetness': 15.0,
+            'sun_altitude_angle': 20.0
+        },
+        'fog_dense': {
+            'cloudiness': 95.0, 'precipitation': 0.0, 'precipitation_deposits': 0.0,
+            'wind_intensity': 3.0, 'fog_density': 100.0, 'wetness': 10.0,
+            'sun_altitude_angle': 10.0
+        },
+        'sunset': {
+            'cloudiness': 20.0, 'precipitation': 0.0, 'precipitation_deposits': 0.0,
+            'wind_intensity': 10.0, 'fog_density': 3.0, 'wetness': 0.0,
+            'sun_altitude_angle': 5.0
+        },
+    }
+
+    SCENARIOS = {
+        'commute_to_work': {
+            'name': 'Commute to Work',
+            'timeline': [
+                (0, 'clear_noon'),
+                (0.15, 'cloudy'),
+                (0.30, 'light_rain'),
+                (0.50, 'heavy_rain'),
+                (0.70, 'fog_morning'),
+                (0.85, 'cloudy'),
+                (1.0, 'clear_noon'),
+            ],
+            'transition_duration': 0.05,
+        },
+        'storm_front': {
+            'name': 'Storm Front',
+            'timeline': [
+                (0, 'clear_noon'),
+                (0.10, 'cloudy'),
+                (0.20, 'light_rain'),
+                (0.35, 'heavy_rain'),
+                (0.50, 'storm'),
+                (0.65, 'heavy_rain'),
+                (0.80, 'light_rain'),
+                (0.90, 'cloudy'),
+                (1.0, 'clear_noon'),
+            ],
+            'transition_duration': 0.04,
+        },
+        'fog_dissipation': {
+            'name': 'Fog Dissipation',
+            'timeline': [
+                (0, 'fog_dense'),
+                (0.20, 'fog_morning'),
+                (0.40, 'cloudy'),
+                (0.55, 'light_rain'),
+                (0.70, 'cloudy'),
+                (0.85, 'clear_noon'),
+                (1.0, 'sunset'),
+            ],
+            'transition_duration': 0.05,
+        },
+        'clear_to_storm': {
+            'name': 'Clear to Storm',
+            'timeline': [
+                (0, 'clear_noon'),
+                (0.25, 'cloudy'),
+                (0.50, 'light_rain'),
+                (0.75, 'storm'),
+                (1.0, 'heavy_rain'),
+            ],
+            'transition_duration': 0.06,
+        },
+    }
+
+    RANDOM_EVENTS = [
+        {'name': 'Sudden Gust', 'preset': 'storm', 'duration_pct': 0.05, 'probability': 0.002},
+        {'name': 'Fog Patch', 'preset': 'fog_morning', 'duration_pct': 0.08, 'probability': 0.001},
+        {'name': 'Rain Burst', 'preset': 'heavy_rain', 'duration_pct': 0.04, 'probability': 0.003},
+    ]
+
+    def __init__(self, scenario_name='storm_front', duration=60, enable_random_events=True):
+        self.scenario_name = scenario_name
+        self.duration = duration
+        self.enable_random_events = enable_random_events
+        self.scenario = self.SCENARIOS.get(scenario_name, self.SCENARIOS['storm_front'])
+        self.timeline = self.scenario['timeline']
+        self.transition_duration = self.scenario['transition_duration']
+        self.current_phase = self.timeline[0][1]
+        self.next_phase = self.timeline[0][1]
+        self.phase_progress = 0.0
+        self.current_params = dict(self.WEATHER_PRESETS[self.timeline[0][1]])
+        self.active_random_event = None
+        self.random_event_start = 0.0
+        self.random_event_end = 0.0
+        self.random_event_base_params = None
+        self._last_logged_phase = None
+
+    def _lerp(self, a, b, t):
+        return a + (b - a) * t
+
+    def _lerp_params(self, params_a, params_b, t):
+        result = {}
+        for key in params_a:
+            result[key] = round(self._lerp(params_a[key], params_b.get(key, params_a[key]), t), 1)
+        return result
+
+    def _get_timeline_segment(self, progress):
+        for i in range(len(self.timeline) - 1):
+            start_pct, start_preset = self.timeline[i]
+            end_pct, end_preset = self.timeline[i + 1]
+            if start_pct <= progress < end_pct:
+                segment_progress = (progress - start_pct) / (end_pct - start_pct) if end_pct > start_pct else 1.0
+                return start_preset, end_preset, segment_progress
+        last_preset = self.timeline[-1][1]
+        return last_preset, last_preset, 1.0
+
+    def _check_random_event(self, progress, elapsed):
+        if not self.enable_random_events or self.active_random_event is not None:
+            return
+        for event in self.RANDOM_EVENTS:
+            if random.random() < event['probability']:
+                self.active_random_event = event
+                self.random_event_start = progress
+                self.random_event_end = min(progress + event['duration_pct'], 1.0)
+                self.random_event_base_params = dict(self.current_params)
+                logging.info(f"Weather random event: {event['name']} (until {self.random_event_end*100:.0f}%)")
+                break
+
+    def _apply_random_event(self, base_params, progress):
+        if self.active_random_event is None:
+            return base_params
+        if progress >= self.random_event_end:
+            logging.info(f"Random event ended: {self.active_random_event['name']}")
+            self.active_random_event = None
+            self.random_event_base_params = None
+            return base_params
+        event_progress = (progress - self.random_event_start) / (self.random_event_end - self.random_event_start)
+        event_t = math.sin(event_progress * math.pi)
+        event_params = self.WEATHER_PRESETS[self.active_random_event['preset']]
+        return self._lerp_params(base_params, event_params, event_t * 0.7)
+
+    def update(self, elapsed):
+        progress = min(elapsed / self.duration, 1.0) if self.duration > 0 else 0.0
+        self._check_random_event(progress, elapsed)
+        start_preset, end_preset, segment_progress = self._get_timeline_segment(progress)
+        self.current_phase = start_preset
+        self.next_phase = end_preset
+        self.phase_progress = segment_progress
+        start_params = self.WEATHER_PRESETS[start_preset]
+        end_params = self.WEATHER_PRESETS[end_preset]
+        trans_start = 1.0 - self.transition_duration / max(self._get_segment_duration(progress), 0.001)
+        if segment_progress < trans_start:
+            self.current_params = dict(start_params)
+        else:
+            t = (segment_progress - trans_start) / (1.0 - trans_start) if trans_start < 1.0 else 1.0
+            self.current_params = self._lerp_params(start_params, end_params, t)
+        self.current_params = self._apply_random_event(self.current_params, progress)
+        if self.current_phase != self._last_logged_phase:
+            logging.info(f"Weather phase: {start_preset} -> {end_preset} ({progress*100:.0f}%)")
+            self._last_logged_phase = self.current_phase
+        return self.current_params
+
+    def _get_segment_duration(self, progress):
+        for i in range(len(self.timeline) - 1):
+            start_pct, _ = self.timeline[i]
+            end_pct, _ = self.timeline[i + 1]
+            if start_pct <= progress < end_pct:
+                return (end_pct - start_pct) * self.duration
+        return self.duration
+
+    def get_phase_label(self):
+        phase_names = {
+            'clear_noon': 'Clear', 'cloudy': 'Cloudy', 'light_rain': 'Light Rain',
+            'heavy_rain': 'Heavy Rain', 'storm': 'Storm', 'fog_morning': 'Fog',
+            'fog_dense': 'Dense Fog', 'sunset': 'Sunset',
+        }
+        current = phase_names.get(self.current_phase, self.current_phase)
+        next_name = phase_names.get(self.next_phase, self.next_phase)
+        if self.active_random_event:
+            return f"{current}->{next_name} [{self.active_random_event['name']}]"
+        if self.current_phase == self.next_phase:
+            return current
+        return f"{current}->{next_name}"
+
+    def get_scenario_name(self):
+        return self.scenario['name']
+
+    def get_progress_pct(self):
+        return self.phase_progress * 100
+
+
+class HUDOverlay:
+    def __init__(self, display_size):
+        self.width = display_size[0]
+        self.height = display_size[1]
+        self.visible = True
+        self._font_large = pygame.font.Font(None, 36)
+        self._font_small = pygame.font.Font(None, 26)
+        self._font_title = pygame.font.Font(None, 42)
+        self._surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        self._screenshot_dir = 'screenshots'
+        self._screenshot_count = 0
+        self._last_auto_screenshot_phase = None
+        os.makedirs(self._screenshot_dir, exist_ok=True)
+
+    def render(self, display, vehicle=None, weather_phase='', fps=0, elapsed=0,
+               duration=0, paused=False, frame_count=0, memory_mb=0,
+               camera_frames=0, lidar_frames=0, radar_frames=0,
+               vehicles_count=0, debug_mode=False, mode=''):
+        if not self.visible:
+            return
+
+        self._surface.fill((0, 0, 0, 0))
+
+        panel_w = 340
+        panel_h = 200
+        panel_x = 10
+        panel_y = 10
+
+        panel_bg = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel_bg.fill((0, 0, 0, 160))
+        pygame.draw.rect(panel_bg, (0, 200, 255, 180), (0, 0, panel_w, panel_h), 2, border_radius=6)
+        self._surface.blit(panel_bg, (panel_x, panel_y))
+
+        y = panel_y + 8
+        status_text = "PAUSED" if paused else "RUNNING"
+        status_color = (255, 200, 0) if paused else (0, 255, 100)
+        title_surf = self._font_title.render("CARLA AV Simulation", True, (0, 200, 255))
+        self._surface.blit(title_surf, (panel_x + 10, y))
+        y += 35
+
+        status_surf = self._font_small.render(status_text, True, status_color)
+        self._surface.blit(status_surf, (panel_x + panel_w - status_surf.get_width() - 10, panel_y + 14))
+
+        pygame.draw.line(self._surface, (0, 200, 255, 120), (panel_x + 8, y), (panel_x + panel_w - 8, y))
+        y += 8
+
+        speed_kmh = 0.0
+        if vehicle is not None:
+            try:
+                v = vehicle.get_velocity()
+                speed_kmh = 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
+            except Exception:
+                pass
+
+        speed_color = (0, 255, 100) if speed_kmh < 60 else (255, 200, 0) if speed_kmh < 100 else (255, 80, 80)
+        speed_surf = self._font_large.render(f"Speed: {speed_kmh:.0f} km/h", True, speed_color)
+        self._surface.blit(speed_surf, (panel_x + 10, y))
+        y += 30
+
+        if weather_phase:
+            weather_surf = self._font_small.render(f"Weather: {weather_phase}", True, (180, 220, 255))
+            self._surface.blit(weather_surf, (panel_x + 10, y))
+            y += 22
+
+        progress_pct = min(elapsed / duration, 1.0) if duration > 0 else 0
+        bar_x = panel_x + 10
+        bar_w = panel_w - 20
+        bar_h = 14
+        pygame.draw.rect(self._surface, (60, 60, 60, 200), (bar_x, y, bar_w, bar_h), border_radius=3)
+        fill_w = int(bar_w * progress_pct)
+        if fill_w > 0:
+            bar_color = (0, 200, 100) if progress_pct < 0.8 else (255, 200, 0)
+            pygame.draw.rect(self._surface, bar_color, (bar_x, y, fill_w, bar_h), border_radius=3)
+        prog_text = self._font_small.render(f"{progress_pct*100:.0f}%  {elapsed:.0f}/{duration}s", True, (255, 255, 255))
+        self._surface.blit(prog_text, (bar_x + bar_w // 2 - prog_text.get_width() // 2, y - 1))
+        y += 20
+
+        info_lines = [
+            f"FPS: {fps:.1f}  |  Mem: {memory_mb:.0f}MB",
+            f"Cam: {camera_frames}  LiDAR: {lidar_frames}  Radar: {radar_frames}",
+        ]
+        for line in info_lines:
+            surf = self._font_small.render(line, True, (200, 200, 200))
+            self._surface.blit(surf, (panel_x + 10, y))
+            y += 20
+
+        if debug_mode:
+            y += 4
+            pygame.draw.line(self._surface, (0, 200, 255, 80), (panel_x + 8, y), (panel_x + panel_w - 8, y))
+            y += 6
+            debug_lines = [
+                f"Frame: {frame_count}  Vehicles: {vehicles_count}",
+                f"Mode: {mode}",
+            ]
+            for line in debug_lines:
+                surf = self._font_small.render(line, True, (160, 160, 160))
+                self._surface.blit(surf, (panel_x + 10, y))
+                y += 18
+
+        hint_y = self.height - 30
+        hint_bg = pygame.Surface((self.width, 30), pygame.SRCALPHA)
+        hint_bg.fill((0, 0, 0, 120))
+        self._surface.blit(hint_bg, (0, hint_y))
+        hints = "[Space] Pause   [H] Toggle HUD   [P] Screenshot   [Q] Quit   [D] Debug"
+        hint_surf = self._font_small.render(hints, True, (160, 160, 160))
+        self._surface.blit(hint_surf, (self.width // 2 - hint_surf.get_width() // 2, hint_y + 5))
+
+        display.blit(self._surface, (0, 0))
+
+    def toggle(self):
+        self.visible = not self.visible
+
+    def save_screenshot(self, display, label=''):
+        self._screenshot_count += 1
+        timestamp = datetime.now().strftime('%H%M%S')
+        filename = f"sim_{timestamp}_{self._screenshot_count}"
+        if label:
+            filename += f"_{label}"
+        filename += ".png"
+        filepath = os.path.join(self._screenshot_dir, filename)
+        pygame.image.save(display, filepath)
+        logging.info(f"Screenshot saved: {filepath}")
+        return filepath
+
+    def auto_screenshot_on_phase_change(self, display, current_phase):
+        if current_phase != self._last_auto_screenshot_phase:
+            self._last_auto_screenshot_phase = current_phase
+            return self.save_screenshot(display, current_phase)
+        return None
+
+
 class SimulationDashboard:
     def __init__(self, duration, weather_name='rain', mode='quick'):
         self.duration = duration
         self.weather_name = weather_name
         self.mode = mode
         self.weather_intensity = 1.0
+        self.weather_phase = ''
         self.paused = False
         self.debug_mode = False
         self.quit_requested = False
@@ -1925,8 +2308,11 @@ class SimulationDashboard:
 
         table.add_row(f"  FPS: [cyan]{self.fps:6.1f}[/] | Memory: [cyan]{self.memory_mb:.0f}MB[/]")
 
-        weather_label = self._get_weather_label()
-        table.add_row(f"  Weather: [cyan]{weather_label} ({self.weather_intensity*100:.0f}%)[/]")
+        if self.weather_phase:
+            table.add_row(f"  Weather: [cyan]{self.weather_phase}[/]")
+        else:
+            weather_label = self._get_weather_label()
+            table.add_row(f"  Weather: [cyan]{weather_label} ({self.weather_intensity*100:.0f}%)[/]")
 
         sensor_parts = [f"Camera: [cyan]{self.camera_frames}[/]"]
         sensor_parts.append(f"LiDAR: [cyan]{self.lidar_frames}[/]")
